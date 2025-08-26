@@ -1,0 +1,325 @@
+%% Clear workspace
+clearvars; clc;
+
+%% Paths
+addpath(genpath('C:\Users\20220978\Downloads\YALMIP'))
+addpath('C:\gurobi1203\win64\matlab')
+
+%% Time horizon
+dt_min = 10; dt = dt_min/60;
+T = 24*60/dt_min;
+t = (1:T)';
+
+%% Try to load external price timeseries (optional)
+% Expected to define c_imp (Tx1), c_exp (Tx1), margin (scalar)
+try
+    run("price_timeseries.m");  % your own file; skip if missing
+catch
+    % Fallback baseline if file not found or variables missing
+end
+if ~exist('c_imp','var') || ~exist('c_exp','var') || ~exist('margin','var')
+    c_imp  = 0.15 + 0.05*sin(2*pi*t/T);
+    c_exp  = 0.05*ones(T,1);
+    margin = 0.10;
+end
+
+%% Station parameters (shared)
+K = 2; % charger types
+chargerCapacity = [150; 300];
+chargerCost     = [40000; 80000];
+
+% CapEx coefficients
+BatteryEnergyCost = 100;     % €/kWh
+BatteryPowerCost  = 200;     % €/kW
+PanelsEnergyCost  = 700;     % €/kWp
+GridPowerCost     = 150;     % €/kW
+
+% For reproducibility
+rng(42);
+
+%% Scenarios list
+scenarioNames = { ...
+  'S1_Baseline_Sunny', ...
+  'S2_Cloudy', ...
+  'S3_HeavyTrucks', ...
+  'S4_EveningSpike', ...
+  'S5_ShortAmort'};
+
+% Preallocate results struct
+Results = struct([]);
+
+% Create output dir
+outdir = fullfile(pwd,'results');
+if ~exist(outdir,'dir'), mkdir(outdir); end
+
+for sId = 1:numel(scenarioNames)
+    scen = scenarioNames{sId};
+    fprintf('\n=== Running %s ===\n', scen);
+
+    %% ---------------- VEHICLE ARRIVAL MODULE ----------------
+    % Base traffic settings (will be tweaked per scenario below)
+    lambda = 0.5;            % avg arrivals per hour
+    Vmax   = 120;            % hard cap to keep MILP size reasonable
+
+    % Generate arrivals per slot using Poisson(lambda*dt)
+    lambda_slot = lambda * dt;
+    arrivals_per_slot = poissrnd(lambda_slot, T, 1);
+    arrivalTimes = [];
+    for tt = 1:T
+        if arrivals_per_slot(tt) > 0
+            arrivalTimes = [arrivalTimes; tt*ones(arrivals_per_slot(tt),1)];
+        end
+    end
+    if numel(arrivalTimes) > Vmax
+        arrivalTimes = arrivalTimes(1:Vmax);
+    end
+    V = numel(arrivalTimes);
+    departureTimes = min(arrivalTimes + randi([6,30],V,1), T);  % 1–5 hours dwell (10-min slots)
+
+    % Vehicle battery parameters (will be tweaked in S3)
+    Cap_batt  = 200*ones(V,1);         % kWh capacity per vehicle (base = trucks)
+    SoC_init  = 0.2 + 0.3*rand(V,1);   % initial SoC 20–50%
+    SoC_target= 0.8*ones(V,1);         % target SoC 80%
+    Eneed     = (SoC_target - SoC_init).*Cap_batt; % kWh to deliver
+    eta_ch    = 0.95;                  % charging efficiency
+
+    %% ---------------- ENERGY PRICE/PRODUCTION MODULE ----------------
+    cimp  = c_imp;     % start from external/baseline
+    cexp  = c_exp;
+    m     = margin;
+    % PV normalized (will be tweaked per scenario)
+    Ppv_perkWp = max(0, sin(pi*(t-30)/T));
+    % Default amort
+    amortyears = 6;
+
+    %% ---------------- SCENARIO TWEAKS ----------------
+    switch scen
+        case 'S1_Baseline_Sunny'
+            % Baseline stays as defaults
+            % lambda = 0.5, sunny PV, moderate prices, amort=6
+
+        case 'S2_Cloudy'
+            % Reduce PV amplitude
+            Ppv_perkWp = max(0, 0.3 * sin(pi*(t-30)/T));
+            amortyears = 6;
+
+        case 'S3_HeavyTrucks'
+            lambda = 0.8;  % higher traffic
+            % regenerate arrivals with new lambda
+            lambda_slot = lambda * dt;
+            arrivals_per_slot = poissrnd(lambda_slot, T, 1);
+            arrivalTimes = [];
+            for tt = 1:T
+                if arrivals_per_slot(tt) > 0
+                    arrivalTimes = [arrivalTimes; tt*ones(arrivals_per_slot(tt),1)];
+                end
+            end
+            if numel(arrivalTimes) > Vmax
+                arrivalTimes = arrivalTimes(1:Vmax);
+            end
+            V = numel(arrivalTimes);
+            departureTimes = min(arrivalTimes + randi([6,30],V,1), T);
+
+            % re-sample vehicle params with new V
+            Cap_batt  = 200*ones(V,1);
+            heavy_idx = rand(V,1) < 0.5;        % 50% heavy trucks
+            Cap_batt(heavy_idx) = 300;          % 300 kWh packs
+            SoC_init  = 0.2 + 0.3*rand(V,1);
+            SoC_target= 0.8*ones(V,1);
+            Eneed     = (SoC_target - SoC_init).*Cap_batt;
+            amortyears = 6;
+
+        case 'S4_EveningSpike'
+            % Add evening price hike 17:00–20:00
+            idx_spike = (t >= 17*60/dt_min) & (t <= 20*60/dt_min);
+            cimp(idx_spike) = cimp(idx_spike) + 0.15;
+            amortyears = 6;
+
+        case 'S5_ShortAmort'
+            % Same as baseline but with short amortization (2 years)
+            amortyears = 2;
+
+        otherwise
+            error('Unknown scenario');
+    end
+
+    % Customer price
+    ccust = cimp + m;
+
+    %% ---------------- CHARGING STATION MODULE ----------------
+    x    = binvar(V,K,T);               % vehicle-to-charger-type assignment
+    p_vt = sdpvar(V,T,'full');          % kW allocated to vehicle v at t (AC/DC power)
+    u    = sdpvar(V,1);                 % unmet energy slack (kept for feasibility)
+
+    %% ---------------- MICROGRID MODULE ----------------
+    Epv = sdpvar(1); Ebat = sdpvar(1); Pbat = sdpvar(1); Pgrid = sdpvar(1);
+    p_bat_ch = sdpvar(T,1); p_bat_dis = sdpvar(T,1); soc = sdpvar(T,1);
+    g_import = sdpvar(T,1); g_export = sdpvar(T,1); p_curt = sdpvar(T,1);
+    Paux = zeros(T,1);
+
+    %% ---------------- CONSTRAINTS ----------------
+    Constraints = [];
+    % Investment variable bounds
+    Constraints = [Constraints, Epv >= 0, Ebat >= 0, Pbat >= 0, Pgrid >= 0];
+    N = intvar(K,1);                    % number of chargers per type
+    Constraints = [Constraints, N >= 0];
+
+    % Vehicle service windows + assignment logic
+    for v=1:V
+        for tt=1:T
+            inWin = (tt>=arrivalTimes(v) && tt<=departureTimes(v));
+            if ~inWin
+                Constraints = [Constraints, sum(x(v,:,tt))==0, p_vt(v,tt)==0];
+            else
+                % At most one charger type at a time
+                Constraints = [Constraints, sum(x(v,:,tt)) <= 1];
+                % Cap by the selected type (NOT max of types)
+                Constraints = [Constraints, p_vt(v,tt) <= x(v,:,tt)*chargerCapacity ];
+            end
+            Constraints = [Constraints, p_vt(v,tt) >= 0];
+        end
+        % Delivered energy with efficiency; SOFT requirement for feasibility
+        delivered = sum(p_vt(v,:))*dt*eta_ch;
+        Constraints = [Constraints, delivered + u(v) >= Eneed(v), u(v) >= 0];
+    end
+
+    % Charger occupancy & station nameplate
+    for tt=1:T
+        for k=1:K
+            Constraints = [Constraints, sum(x(:,k,tt)) <= N(k)];
+        end
+        Constraints = [Constraints, sum(p_vt(:,tt)) <= N'*chargerCapacity];
+    end
+
+    % Microgrid balance & device limits
+    for tt=1:T
+        Ppv_t = Epv*Ppv_perkWp(tt);
+        Constraints = [Constraints, g_import(tt)-g_export(tt)+...
+            p_bat_dis(tt)-p_bat_ch(tt)+Ppv_t-p_curt(tt) == sum(p_vt(:,tt))+Paux(tt)];
+        Constraints = [Constraints, g_import(tt)>=0, g_export(tt)>=0, ...
+            p_bat_ch(tt)>=0, p_bat_dis(tt)>=0, p_curt(tt)>=0];
+        Constraints = [Constraints, g_import(tt)<=Pgrid, g_export(tt)<=Pgrid];
+        Constraints = [Constraints, p_bat_ch(tt)<=Pbat, p_bat_dis(tt)<=Pbat];
+        % Curtailment cannot exceed PV
+        Constraints = [Constraints, p_curt(tt) <= Ppv_t];
+    end
+
+    % Battery dynamics
+    eta_c = 0.95; eta_d = 0.95;
+    Constraints = [Constraints, 0<=soc<=Ebat];
+    Constraints = [Constraints, soc(1)==0.5*Ebat + (eta_c*p_bat_ch(1)-p_bat_dis(1)/eta_d)*dt];
+    for tt=1:T-1
+        Constraints = [Constraints, soc(tt+1)==soc(tt)+(eta_c*p_bat_ch(tt)-p_bat_dis(tt)/eta_d)*dt];
+    end
+    % Optional: cyclic end SOC (commented; leave free to let optimizer choose)
+    % Constraints = [Constraints, soc(T) == 0.5*Ebat];
+
+    %% ---------------- OBJECTIVE ----------------
+    CapEx = (chargerCost'*N + BatteryEnergyCost*Ebat + BatteryPowerCost*Pbat ...
+        + PanelsEnergyCost*Epv + GridPowerCost*Pgrid) / (365*amortyears);
+
+    OpEx = sum(cimp.*(g_import*dt)) - sum(cexp.*(g_export*dt));
+    Revenue = sum(ccust.*sum(p_vt,1)'*dt);
+    Penalty = 200*sum(u);  % set high to discourage unmet energy
+
+    Objective = CapEx + OpEx - Revenue + Penalty;
+
+    %% ---------------- SOLVE ----------------
+    ops = sdpsettings('solver','gurobi','verbose',1);
+    sol = optimize(Constraints,Objective,ops);
+    if sol.problem ~= 0
+        warning('Solver reported issue: %s', sol.info);
+    end
+
+    %% ---------------- KPIs & TIME SERIES ----------------
+    N_star    = value(N);
+    Ebat_star = value(Ebat);
+    Pbat_star = value(Pbat);
+    Epv_star  = value(Epv);
+    Pgrid_star= value(Pgrid);
+
+    P_EV   = sum(value(p_vt),1)';                   % kW, T x 1
+    Gimp   = value(g_import);                       % kW
+    Gexp   = value(g_export);                       % kW
+    SOC    = value(soc);                            % kWh
+    Pch    = value(p_bat_ch);                       % kW
+    Pdis   = value(p_bat_dis);                      % kW
+    PVgen  = Epv_star * Ppv_perkWp;                 % kW
+    Curt   = value(p_curt);                         % kW
+
+    Results(sId).Scenario   = scen;
+    Results(sId).N          = N_star(:)';
+    Results(sId).Epv_kWp    = Epv_star;
+    Results(sId).Ebat_kWh   = Ebat_star;
+    Results(sId).Pbat_kW    = Pbat_star;
+    Results(sId).Pgrid_kW   = Pgrid_star;
+    Results(sId).Obj_perDay = value(Objective);
+    Results(sId).OpEx_perDay= value(OpEx);
+    Results(sId).Revenue    = value(Revenue);
+    Results(sId).CapEx_day  = value(CapEx);
+    Results(sId).Unserved_kWh = sum(value(u));
+    Results(sId).GridImp_kWh  = sum(Gimp)*dt;
+    Results(sId).GridExp_kWh  = sum(Gexp)*dt;
+    Results(sId).PVGen_kWh    = sum(PVgen)*dt;
+    Results(sId).Curt_kWh     = sum(Curt)*dt;
+    Results(sId).PeakImp_kW   = max(Gimp);
+
+    %% ---------------- PLOTS ----------------
+    % 1) EV Load vs Grid Import/Export
+    f1 = figure('visible','off'); 
+    plot(t, P_EV, 'LineWidth',1.2); hold on;
+    plot(t, Gimp, 'LineWidth',1.2);
+    plot(t, Gexp, 'LineWidth',1.2);
+    title(sprintf('%s: EV Load vs Grid', scen),'Interpreter','none');
+    xlabel('Time step (10-min)'); ylabel('Power [kW]');
+    legend('EV Load','Grid Import','Grid Export','Location','best');
+    grid on;
+    saveas(f1, fullfile(outdir, sprintf('%s_EV_vs_Grid.png',scen)));
+
+    % 2) Battery SOC and Charge/Discharge Power
+    f2 = figure('visible','off');
+    yyaxis left;  plot(t, SOC, 'LineWidth',1.2); ylabel('SOC [kWh]');
+    yyaxis right; plot(t, Pch, 'LineWidth',1.2); hold on; plot(t, Pdis, 'LineWidth',1.2);
+    title(sprintf('%s: Battery SOC & Power', scen),'Interpreter','none');
+    xlabel('Time step (10-min)'); ylabel('Power [kW]');
+    legend('SOC','Charge','Discharge','Location','best');
+    grid on;
+    saveas(f2, fullfile(outdir, sprintf('%s_Battery_SOC_Power.png',scen)));
+
+    % 3) PV Generation vs Curtailment
+    f3 = figure('visible','off');
+    plot(t, PVgen, 'LineWidth',1.2); hold on;
+    plot(t, Curt,  'LineWidth',1.2);
+    title(sprintf('%s: PV Generation vs Curtailment', scen),'Interpreter','none');
+    xlabel('Time step (10-min)'); ylabel('Power [kW]');
+    legend('PV Generation','Curtailment','Location','best');
+    grid on;
+    saveas(f3, fullfile(outdir, sprintf('%s_PV_vs_Curtail.png',scen)));
+
+    close([f1 f2 f3]);  % keep workspace clean
+end
+
+%% ---------------- SIMULATION RESULTS TABLE ----------------
+% Convert Results struct to table for easy printing
+% Expand N (chargers per type) into columns N1, N2
+N1 = arrayfun(@(r) (numel(r.N)>=1)*r.N(1) + (numel(r.N)<1)*0, Results)';
+N2 = arrayfun(@(r) (numel(r.N)>=2)*r.N(2) + (numel(r.N)<2)*0, Results)';
+
+SimTable = table( ...
+    string({Results.Scenario})', ...
+    N1, N2, ...
+    [Results.Epv_kWp]', [Results.Ebat_kWh]', [Results.Pbat_kW]', [Results.Pgrid_kW]', ...
+    [Results.PVGen_kWh]', [Results.Curt_kWh]', ...
+    [Results.GridImp_kWh]', [Results.GridExp_kWh]', [Results.PeakImp_kW]', ...
+    [Results.Unserved_kWh]', ...
+    [Results.CapEx_day]', [Results.OpEx_perDay]', [Results.Revenue]', [Results.Obj_perDay]', ...
+    'VariableNames', {'Scenario','N_Type1','N_Type2','Epv_kWp','Ebat_kWh','Pbat_kW','Pgrid_kW', ...
+    'PVGen_kWh','Curt_kWh','GridImp_kWh','GridExp_kWh','PeakImp_kW','Unserved_kWh', ...
+    'CapEx_perDay','OpEx_perDay','Revenue','Objective_perDay'});
+
+disp('--- Simulation Results Table ---');
+disp(SimTable);
+
+% Save CSV for report
+writetable(SimTable, fullfile(outdir,'Simulation_Results_Table.csv'));
+fprintf('\nSaved results to: %s\n', outdir);
