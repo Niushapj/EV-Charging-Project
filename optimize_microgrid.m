@@ -80,6 +80,8 @@ for tt=1:T
 end
 
 % Microgrid balance
+C_rate = 0.5;                     % battery C-rate (0.5C = 2h full charge/discharge)
+Pbat_max = C_rate * Ebat;         % max power based on capacity
 for tt=1:T
     Ppv_t = Epv*Ppv_perkWp(tt);
     Constraints = [Constraints, g_import(tt)-g_export(tt)+...
@@ -88,12 +90,22 @@ for tt=1:T
         p_bat_ch(tt)>=0, p_bat_dis(tt)>=0, p_curt(tt)>=0];
     Constraints = [Constraints, g_import(tt)<=Pgrid, g_export(tt)<=Pgrid];
     Constraints = [Constraints, p_bat_ch(tt)<=Pbat, p_bat_dis(tt)<=Pbat];
-
+    Constraints = [Constraints, p_bat_ch(tt) <= Pbat_max];
+    Constraints = [Constraints, p_bat_dis(tt) <= Pbat_max];
 end
+% Energy bounds (kWh)
+Ebat_min = 10;        % set a small positive min to avoid div-by-zero, adjust as needed
+Ebat_max = 5000;       % realistic max battery energy (kWh) - tune for your system
+Constraints = [Constraints, Ebat_min <= Ebat <= Ebat_max];
 
+% Power bounds (kW)
+Pbat_min = 0;
+Pbat_max_fixed = 3000; % absolute power cap (kW) - tune as needed
+Constraints = [Constraints, Pbat_min <= Pbat <= Pbat_max_fixed];
 % Battery dynamics
 Constraints = [Constraints, 0<=soc<=Ebat];
-Constraints = [Constraints, soc(1)==0.5*Ebat + (0.95*p_bat_ch(1)-p_bat_dis(1)/0.95)*dt];
+% % % Constraints = [Constraints, soc(1)==0.5*Ebat + (0.95*p_bat_ch(1)-p_bat_dis(1)/0.95)*dt];
+Constraints = [Constraints, soc(1) == 0];
 for tt=1:T-1
     Constraints = [Constraints, soc(tt+1)==soc(tt)+(0.95*p_bat_ch(tt)-p_bat_dis(tt)/0.95)*dt];
 end
@@ -125,7 +137,7 @@ results.Pgrid = value(Pgrid);
 results.EVload = value(sum(p_vt,1))';         % total EV demand per timestep
 results.GridImport = value(g_import);
 results.GridExport = value(g_export);
-results.SOC = value(soc);
+results.SOC = 100*value(soc)/value(Ebat);
 results.Pbat_ch = value(p_bat_ch);
 results.Pbat_dis = value(p_bat_dis);
 % disp("Optimal chargers per type:"); disp(results.N)
