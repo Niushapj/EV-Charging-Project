@@ -93,8 +93,18 @@ for tt=1:T
     Constraints = [Constraints, p_bat_ch(tt) <= Pbat_max];
     Constraints = [Constraints, p_bat_dis(tt) <= Pbat_max];
 end
+%% Battery ramping constraints
+Ramp_limit = 0.15 * Pbat_max;   % max allowed change per timestep (adjust as needed)
+
+for tt = 2:T
+    Constraints = [Constraints, p_bat_ch(tt) - p_bat_ch(tt-1) <= Ramp_limit];
+    Constraints = [Constraints, p_bat_ch(tt-1) - p_bat_ch(tt) <= Ramp_limit];
+    
+    Constraints = [Constraints, p_bat_dis(tt) - p_bat_dis(tt-1) <= Ramp_limit];
+    Constraints = [Constraints, p_bat_dis(tt-1) - p_bat_dis(tt) <= Ramp_limit];
+end
 % Energy bounds (kWh)
-Ebat_min = 10;        % set a small positive min to avoid div-by-zero, adjust as needed
+Ebat_min = 0;        % set a small positive min to avoid div-by-zero, adjust as needed
 Ebat_max = 5000;       % realistic max battery energy (kWh) - tune for your system
 Constraints = [Constraints, Ebat_min <= Ebat <= Ebat_max];
 
