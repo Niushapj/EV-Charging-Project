@@ -1,0 +1,147 @@
+%% ---------------- SETUP ----------------
+clearvars; clc; clear all; close all;
+
+%% Paths
+addpath(genpath('C:\Users\20245265\Downloads\YALMIP-master\YALMIP-master'))
+addpath('C:\gurobi1203\win64\matlab')
+
+%% Define scenarios
+scenarios = {
+    % arrival_dist  amortyears  Peak_imp  Peak_exp  Ppv_percentage  veh_cap_bat
+    1              6           1         1         1              200
+    1              6           1         1         0.3            200
+    0              6           1         1         1              300
+    1              2           1         1         0.5            200
+};
+
+nScenarios = size(scenarios,1);
+results_all = cell(nScenarios,1);
+
+%% ---------------- RUN EACH SCENARIO ----------------
+for i = 1:nScenarios
+    fprintf('\n--- Running Scenario %d ---\n', i);
+
+    arrival_dist   = scenarios{i,1};
+    amortyears     = scenarios{i,2};
+    Peak_imp       = scenarios{i,3};
+    Peak_exp       = scenarios{i,4};
+    Ppv_percentage = scenarios{i,5};
+    veh_cap_bat    = scenarios{i,6};
+
+    % Run optimization
+    results = optimize_microgrid(arrival_dist, amortyears, Peak_imp, Peak_exp, Ppv_percentage, veh_cap_bat);
+    results_all{i} = results;
+
+    %% Display summary
+    disp("Optimal chargers per type:"); disp(results.N)
+    disp("Battery size [kWh]:"); disp(results.Ebat)
+    disp("PV size [kWp]:"); disp(results.Epv)
+    disp("Grid connection [kW]:"); disp(results.Pgrid)
+
+    %% PLOTS - INDIVIDUAL SCENARIO
+    figure('Name',sprintf('Scenario %d: Grid',i));
+    plot(results.GridImport,'b','LineWidth',1.5); hold on;
+    plot(results.GridExport,'r','LineWidth',1.5);
+    ylabel('Grid Power [kW]');
+    xlabel('Time step'); grid on;
+    legend('Grid Import','Grid Export');
+    title(sprintf('Scenario %d: Grid Import vs Export',i));
+
+    figure('Name',sprintf('Scenario %d: Ppv',i));
+    plot(results.Ppv,'g','LineWidth',1.5);
+    ylabel('Power [kW]');
+    xlabel('Time step'); grid on;
+    legend('Ppv','Location','best');
+    title(sprintf('Scenario %d: PV Production',i));
+
+    figure('Name',sprintf('Scenario %d: Battery',i));
+    subplot(2,1,1);
+    plot(results.SOC,'LineWidth',1.5);
+    ylabel('SOC [%]'); xlabel('Time step'); grid on;
+    title(sprintf('Scenario %d: Battery State of Charge',i));
+    subplot(2,1,2);
+    plot(results.Pbat_ch,'g','LineWidth',1.5); hold on;
+    plot(results.Pbat_dis,'m','LineWidth',1.5);
+    ylabel('Power [kW]'); xlabel('Time step'); grid on;
+    legend('Charge','Discharge');
+    title(sprintf('Scenario %d: Battery Charge/Discharge Power',i));
+end
+
+%% ---------------- SAVE RESULTS ----------------
+save('results_all.mat','results_all');
+
+%% ---------------- COMPARISON PLOTS ----------------
+disp('Generating combined comparison plots...');
+
+nScen = numel(results_all);
+T  = length(results_all{1}.GridImport);
+dt_min = 10;
+t = (0:T-1)*(dt_min/60); % time in hours
+
+cmap = lines(nScen);
+
+% Labels for legend with system sizes
+scenLabels = cell(nScen,1);
+for i = 1:nScen
+    Ebat  = results_all{i}.Ebat;
+    Epv   = results_all{i}.Epv;
+    Pgrid = results_all{i}.Pgrid;
+    scenLabels{i} = sprintf('S%d (PV=%.0f kWp, Bat=%.0f kWh, Pgrid=%.0f kW)', ...
+                             i, Epv, Ebat, Pgrid);
+end
+
+%% 1) GRID IMPORT & EXPORT
+figure('Name','All Scenarios: Grid Import/Export','Color','w');
+subplot(2,1,1);
+hold on; box on; grid on;
+for i = 1:nScen
+    plot(t, results_all{i}.GridImport, 'LineWidth',1.5, 'Color', cmap(i,:));
+end
+ylabel('Import [kW]'); 
+title('Grid Import Comparison');
+legend(scenLabels,'Location','best');
+xlim([t(1) t(end)]);
+
+subplot(2,1,2);
+hold on; box on; grid on;
+for i = 1:nScen
+    plot(t, results_all{i}.GridExport, '--', 'LineWidth',1.5, 'Color', cmap(i,:));
+end
+ylabel('Export [kW]'); xlabel('Time [h]');
+title('Grid Export Comparison');
+xlim([t(1) t(end)]);
+
+%% 2) BATTERY SOC & NET POWER
+figure('Name','All Scenarios: Battery','Color','w');
+subplot(2,1,1);
+hold on; box on; grid on;
+for i = 1:nScen
+    plot(t, results_all{i}.SOC, 'LineWidth',1.5, 'Color', cmap(i,:));
+end
+ylabel('SOC [%]');
+title('Battery State of Charge Comparison');
+legend(scenLabels,'Location','best');
+xlim([t(1) t(end)]); ylim([0 100]);
+
+subplot(2,1,2);
+hold on; box on; grid on;
+for i = 1:nScen
+    Pnet = results_all{i}.Pbat_dis - results_all{i}.Pbat_ch;
+    plot(t, Pnet, 'LineWidth',1.5, 'Color', cmap(i,:));
+end
+plot(t, zeros(size(t)),'k:','LineWidth',1);
+ylabel('Net Battery Power [kW]');
+xlabel('Time [h]');
+title('Battery Net Power (Discharge - Charge)');
+xlim([t(1) t(end)]);
+
+%% 3) PV PRODUCTION
+figure('Name','All Scenarios: PV Production','Color','w');
+hold on; box on; grid on;
+for i = 1:nScen
+    plot(t, results_all{i}.Ppv, 'LineWidth',1.5, 'Color', cmap(i,:));
+end
+ylabel('PV Power [kW]'); xlabel('Time [h]');
+title('PV Production Comparison');
+legend(scenLabels,'Location','best');
+xlim([t(1) t(end)]);
