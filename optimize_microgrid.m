@@ -3,8 +3,8 @@ function results = optimize_microgrid(arrival_dist, amortyears, Peak_imp, Peak_e
 %% Time horizon
 dt_min = 10; dt = dt_min/60;
 T = 24*60/dt_min;
-t = (1:T)';
-
+%%%t = (1:T);
+t=(0:T-1)*dt;
 %% ---------------- VEHICLE ARRIVAL MODULE ----------------
 switch arrival_dist
     case 0
@@ -46,6 +46,9 @@ Epv = sdpvar(1); Ebat = sdpvar(1); Pbat = sdpvar(1); Pgrid = sdpvar(1);
 p_bat_ch = sdpvar(T,1); p_bat_dis = sdpvar(T,1); soc = sdpvar(T,1);
 g_import = sdpvar(T,1); g_export = sdpvar(T,1); p_curt = sdpvar(T,1);
 
+pv_used = sdpvar(T,1);    % PV actually used
+pv_curt = sdpvar(T,1);    % PV curtailed
+
 Ppv_perkWp = max(0,Ppv_percentage*sin(pi*(t-30)/T)); % normalized PV
 Paux = zeros(T,1);
 
@@ -55,7 +58,7 @@ Constraints = [Constraints, Epv >= 0, Ebat >= 0, Pbat >= 0, Pgrid >= 0];
 Constraints = [Constraints, Epv + Pgrid >= 1e-3];
 N = intvar(K,1);
 Constraints = [Constraints, N >= 1]; 
-
+Constraints = [Constraints, Epv <= 2500]
 % Vehicle service windows
 for v=1:V
     for tt=1:T
@@ -150,6 +153,7 @@ results.GridExport = value(g_export);
 results.SOC = 100*value(soc)/value(Ebat);
 results.Pbat_ch = value(p_bat_ch);
 results.Pbat_dis = value(p_bat_dis);
+results.Ppv = value(Epv) * Ppv_perkWp';
 % disp("Optimal chargers per type:"); disp(results.N)
 % disp("Battery size [kWh]:"); disp(results.Ebat)
 % disp("PV size [kWp]:"); disp(results.Epv)
